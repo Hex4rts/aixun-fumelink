@@ -17,7 +17,12 @@
 // when the station starts the MTU exchange itself (BLE_HS_EALREADY), leaving the link
 // half open. Scanning still uses the Arduino BLEScan.
 //
-// Serial (115200) logs every state change. Commands: relay on|off, runon <ms>
+// WiFi: the board runs its own hotspot "FumeLink" (default password "fumelink" - change
+// it on the page). http://192.168.4.1 shows live status and sets the run-on time, the
+// hotspot password, manual fan on/off, and takes firmware updates (OTA, .bin upload).
+// Settings live in NVS ("fumelink" namespace), never in this file.
+//
+// Serial (115200) logs every state change. Commands: relay on|off, runon <ms>, appass <pw>
 // Status LED: blue = searching, green = linked, red = extracting, orange = run-on.
 //
 // Board: Waveshare ESP32-S3-Zero (WS2812 on GPIO21), arduino-esp32 3.3.x
@@ -26,6 +31,10 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <host/ble_hs.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <Update.h>
 
 // ---- configuration -------------------------------------------------------
 // GPIO4 drives an NPN that pulls the extractor's speed input (pot wiper, via 1 k in
@@ -33,7 +42,9 @@
 // 4k7 GPIO->base, 10k base->GND, emitter to the controller's GND.
 static const int RELAY_PIN = 4;
 static const bool RELAY_ACTIVE_HIGH = false;  // "extractor on" = pin LOW
-static uint32_t runOnMs = 10000;          // keep extracting this long after the iron goes idle
+static uint32_t runOnMs = 10000;          // default run-on after the iron goes idle (NVS overrides)
+static const char *AP_SSID = "FumeLink";
+static const char *AP_DEFAULT_PASS = "fumelink";  // public default: change it on the page
 static const int LED_PIN = 21;            // S3-Zero onboard WS2812
 static const uint8_t LED_LEVEL = 40;      // brightness 0-255
 static const int BUTTON_PIN = 0;          // S3-Zero BOOT button: press toggles the fan by hand
@@ -61,6 +72,15 @@ static bool relayOn = false;
 static uint32_t offAt = 0;  // 0 = no pending run-on timer
 static uint8_t lastMask = 0xFF;
 static uint8_t lastFlags[2] = {0, 0};
+
+// Read by the web task; written by the main loop.
+static volatile uint8_t chFlag[2] = {0, 0};
+static volatile uint16_t chTemp[2] = {0, 0}, chSet[2] = {0, 0};
+static volatile int webFanCmd = -1;  // set by the web task: 0 = off, 1 = on
+
+static Preferences prefs;
+static WebServer web(80);
+static String apPass;
 
 static void logLine(const String &msg) {
   Serial.printf("%10lu ms  %s\n", (unsigned long)millis(), msg.c_str());
@@ -209,6 +229,9 @@ static void handleState(const uint8_t *d, size_t n) {
     } else if (tag == '9' && len >= 2) {
       for (uint8_t ch = 0; ch < 2 && 2 + 6 * ch + 5 < len; ch++) {
         const uint8_t *c = v + 2 + 6 * ch;
+        chFlag[ch] = c[0];
+        chTemp[ch] = c[1] | c[2] << 8;
+        chSet[ch] = c[3] | c[4] << 8;
         if (c[0] != lastFlags[ch]) {
           logLine("CH" + String(ch + 1) + (c[0] == 2 ? " working" : " standby") + "  T=" +
                   String(c[1] | c[2] << 8) + " set=" + String(c[3] | c[4] << 8));
@@ -241,9 +264,9 @@ class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
   }
 };
 
-static void scanDone(BLEScanResults) {
-  BLEDevice::getScan()->clearResults();
-}
+// Nothing to do: start() clears the previous results itself. Clearing here too (from the
+// NimBLE task) raced start() in loop() and double-freed the results (CORRUPT HEAP).
+static void scanDone(BLEScanResults) {}
 
 static bool connectStation() {
   BLEDevice::getScan()->stop();
@@ -300,12 +323,130 @@ static bool connectStation() {
   return true;
 }
 
+static void saveRunOn(uint32_t ms) {
+  runOnMs = constrain(ms, 0UL, 3600000UL);
+  prefs.putUInt("runon", runOnMs);
+  logLine("run-on " + String(runOnMs) + " ms (saved)");
+}
+
+static void startAp() {
+  WiFi.softAP(AP_SSID, apPass.c_str());
+  logLine("hotspot " + String(AP_SSID) + " up at " + WiFi.softAPIP().toString());
+}
+
+static bool saveApPass(const String &pw) {
+  if (pw.length() < 8 || pw.length() > 63) return false;  // WPA2 limits
+  apPass = pw;
+  prefs.putString("appass", apPass);
+  logLine("hotspot password changed");
+  return true;
+}
+
 static void handleCommand(String line) {
   line.trim();
   if (line == "relay on") setRelay(true, "serial");
   else if (line == "relay off") setRelay(false, "serial");
-  else if (line.startsWith("runon ")) { runOnMs = line.substring(6).toInt(); logLine("run-on " + String(runOnMs) + " ms"); }
-  else if (line.length()) logLine("? relay on|off | runon <ms>");
+  else if (line.startsWith("runon ")) saveRunOn(line.substring(6).toInt());
+  else if (line.startsWith("appass ")) {
+    if (saveApPass(line.substring(7))) startAp();
+    else logLine("password must be 8-63 characters");
+  } else if (line.length()) logLine("? relay on|off | runon <ms> | appass <8-63 chars>");
+}
+
+// ---- web page (own task, so it answers even while the BLE side is busy) ----
+static const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>FumeLink</title>
+<style>body{font-family:system-ui,sans-serif;max-width:30em;margin:1em auto;padding:0 1em;background:#111;color:#eee}
+h1{font-size:1.4em}section{background:#222;border-radius:8px;padding:.8em 1em;margin:.8em 0}
+.big{font-size:1.6em;font-weight:600}.on{color:#f55}.off{color:#5c5}.dim{color:#999}
+button,input[type=submit]{font-size:1em;padding:.5em 1em;margin:.2em;border-radius:6px;border:0;background:#446;color:#fff}
+input[type=number],input[type=password]{font-size:1em;padding:.4em;width:8em}table{width:100%}td{padding:.2em 0}</style></head>
+<body><h1>FumeLink</h1>
+<section><div class="big" id="fan">…</div><div id="link" class="dim"></div>
+<table><tr><td>Channel 1</td><td id="c0"></td></tr><tr><td>Channel 2</td><td id="c1"></td></tr></table>
+<button onclick="fan(1)">Fan ON</button><button onclick="fan(0)">Fan OFF</button>
+<div class="dim">Manual switch holds until the iron next changes state.</div></section>
+<section><form method="post" action="/set">Run-on after the iron goes idle:
+<input type="number" name="runon" min="0" max="3600" step="1" id="ro"> s <input type="submit" value="Save"></form></section>
+<section><form method="post" action="/appass">Hotspot password (8-63 chars):
+<input type="password" name="pw" minlength="8" maxlength="63"> <input type="submit" value="Change"></form>
+<div class="dim">You will be disconnected; reconnect with the new password.</div></section>
+<section><form method="post" action="/update" enctype="multipart/form-data">Firmware update (.bin):
+<input type="file" name="fw" accept=".bin"> <input type="submit" value="Upload"></form>
+<div class="dim">A failed upload keeps the current firmware.</div></section>
+<script>
+function fan(v){fetch('/fan?on='+v,{method:'POST'}).then(tick)}
+let roSet=false;
+function tick(){fetch('/status').then(r=>r.json()).then(s=>{
+ const f=document.getElementById('fan');
+ f.textContent=s.fan?(s.runon_left>0?'Fan ON - stops in '+Math.ceil(s.runon_left/1000)+' s':'Fan ON'):'Fan OFF';
+ f.className='big '+(s.fan?'on':'off');
+ document.getElementById('link').textContent=s.linked?'Linked to the station':'Searching for the station…';
+ s.ch.forEach((c,i)=>document.getElementById('c'+i).textContent=
+  c.f?(c.f==2?'working':'standby')+' - '+c.t+' °C (set '+c.s+' °C)':'-');
+ if(!roSet){document.getElementById('ro').value=s.runon_ms/1000;roSet=true}
+})}
+tick();setInterval(tick,1000);
+</script></body></html>)HTML";
+
+static void webSetup() {
+  web.on("/", HTTP_GET, [] { web.send_P(200, "text/html", PAGE); });
+  web.on("/status", HTTP_GET, [] {
+    uint32_t left = (relayOn && offAt) ? (uint32_t)max(0L, (long)(offAt - millis())) : 0;
+    String j = String("{\"linked\":") + (linked ? "true" : "false") + ",\"fan\":" + (relayOn ? "true" : "false") +
+               ",\"runon_ms\":" + runOnMs + ",\"runon_left\":" + left + ",\"ch\":[";
+    for (int i = 0; i < 2; i++)
+      j += String(i ? "," : "") + "{\"f\":" + chFlag[i] + ",\"t\":" + chTemp[i] + ",\"s\":" + chSet[i] + "}";
+    web.send(200, "application/json", j + "]}");
+  });
+  web.on("/fan", HTTP_POST, [] {
+    webFanCmd = web.arg("on") == "1" ? 1 : 0;  // applied by the main loop
+    web.send(200, "text/plain", "ok");
+  });
+  web.on("/set", HTTP_POST, [] {
+    saveRunOn((uint32_t)web.arg("runon").toInt() * 1000);
+    web.sendHeader("Location", "/");
+    web.send(303);
+  });
+  web.on("/appass", HTTP_POST, [] {
+    if (!saveApPass(web.arg("pw"))) {
+      web.send(400, "text/plain", "Password must be 8-63 characters.");
+      return;
+    }
+    web.send(200, "text/plain", "Saved. Reconnect to FumeLink with the new password.");
+    delay(500);
+    startAp();
+  });
+  web.on(
+    "/update", HTTP_POST,
+    [] {
+      bool ok = !Update.hasError();
+      web.send(200, "text/plain", ok ? "Update OK - rebooting." : String("Update failed: ") + Update.errorString());
+      if (ok) {
+        delay(800);
+        ESP.restart();
+      }
+    },
+    [] {
+      HTTPUpload &up = web.upload();
+      if (up.status == UPLOAD_FILE_START) {
+        logLine("OTA start: " + up.filename);
+        Update.begin(UPDATE_SIZE_UNKNOWN);
+      } else if (up.status == UPLOAD_FILE_WRITE) {
+        Update.write(up.buf, up.currentSize);
+      } else if (up.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) logLine("OTA done, " + String(up.totalSize) + " bytes");
+        else logLine(String("OTA failed: ") + Update.errorString());
+      }
+    });
+  web.begin();
+}
+
+static void webTask(void *) {
+  for (;;) {
+    web.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
 }
 
 void setup() {
@@ -322,6 +463,15 @@ void setup() {
   scan->setInterval(100);
   scan->setWindow(90);
   logLine("FumeLink client up, hello name " + helloName());
+
+  prefs.begin("fumelink", false);
+  runOnMs = prefs.getUInt("runon", runOnMs);
+  apPass = prefs.getString("appass", AP_DEFAULT_PASS);
+  logLine("run-on " + String(runOnMs) + " ms");
+  WiFi.mode(WIFI_AP);
+  startAp();
+  webSetup();
+  xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, 1, nullptr, 1);
 }
 
 void loop() {
@@ -342,6 +492,11 @@ void loop() {
     setRelay(!relayOn, "button");
   }
   lastBtn = btn;
+
+  if (webFanCmd >= 0) {
+    setRelay(webFanCmd == 1, "web");
+    webFanCmd = -1;
+  }
 
   if (discEvent) {
     discEvent = false;

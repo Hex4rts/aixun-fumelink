@@ -22,6 +22,8 @@ T420D  ──BLE──►  ESP32-S3-Zero (FumeLink)  ──GPIO4──►  NPN  
 | Reconnect after power-cycling the ESP32 or the station | working (ESP ~3 s, station ~6 s after boot) |
 | Fan on when a handle leaves the stand, run-on timer, then off | working (LED + GPIO) |
 | BOOT button manual toggle, with or without the station | working |
+| WiFi hotspot + web page (status, run-on, fan on/off, password) | working |
+| Firmware update over WiFi (OTA) | implemented, **not yet tested** |
 | Transistor stage: GPIO and base drive | verified on the bench |
 | Transistor stage: collector switching, real extractor | **not yet verified** |
 
@@ -89,14 +91,54 @@ Check with a multimeter in diode mode: with the red probe on the base, you read 
 **BOOT button:** toggles the fan by hand, with or without the station. The station takes
 control again at its next change (handle lifted or replaced).
 
-**Serial** (USB, 115200 baud) logs every link and state change. Commands:
+**On the station:** enable *FumeSuck Link* in its system settings.
+
+### WiFi page (no need to open the enclosure)
+
+FumeLink runs its own WiFi hotspot. It never joins your home network.
+
+1. Connect a phone or PC to WiFi **`FumeLink`**, password **`fumelink`**.
+2. Open **http://192.168.4.1**.
+3. **Change the hotspot password straight away.** The default is published here, and anyone
+   connected to the hotspot can change settings and upload firmware.
+
+The page shows the fan state (with the run-on countdown), whether the station is linked,
+and each channel's state, temperature and setpoint. It also lets you:
+
+- switch the fan **ON / OFF** by hand (holds until the iron next changes state)
+- set the **run-on time** in seconds
+- change the **hotspot password** (8–63 characters; you'll be disconnected and must
+  reconnect with the new one)
+- **upload new firmware** (see below)
+
+Settings are stored on the ESP32 (NVS) and survive reboots and power cuts. They're never in
+the source code.
+
+### Updating firmware over WiFi
+
+1. Build the `.bin`:
+   - Arduino IDE: *Sketch → Export Compiled Binary*, then use `FumeLink.ino.bin` from the `build` folder.
+   - `arduino-cli`: add `--output-dir build` to the compile command below and use `build/FumeLink.ino.bin`.
+2. On the page, choose the file under *Firmware update* and press **Upload**.
+3. The board reboots into the new firmware. If the upload fails or is interrupted, the
+   current firmware keeps running (the ESP32 has two firmware slots).
+
+Settings are kept across updates.
+
+### Serial
+
+USB serial (115200 baud) logs every link and state change. Commands:
 
 | Command | Effect |
 |---|---|
 | `relay on` / `relay off` | switch the fan by hand |
-| `runon <ms>` | set the run-on time (default 10000) |
+| `runon <ms>` | set and save the run-on time |
+| `appass <password>` | set and save the hotspot password (8–63 characters) |
 
-**On the station:** enable *FumeSuck Link* in its system settings.
+`appass` is the recovery path if you forget the hotspot password.
+
+> Closing the serial port with default settings resets the ESP32-S3 (its built-in USB
+> serial treats the DTR/RTS lines dropping as a reset request). That's normal and not a crash.
 
 ## Building and flashing
 
@@ -106,17 +148,30 @@ Clone into a folder named `FumeLink` (Arduino requires the folder name to match 
 git clone https://github.com/Hex4rts/aixun-fumelink.git FumeLink
 ```
 
-Arduino IDE: board *ESP32S3 Dev Module*, USB CDC On Boot *Enabled*, USB Mode
-*Hardware CDC and JTAG*, flash size 4 MB, then Upload. Or with `arduino-cli`
-(arduino-esp32 core 3.3.x):
+Arduino IDE settings:
+
+| Setting | Value |
+|---|---|
+| Board | ESP32S3 Dev Module |
+| USB CDC On Boot | Enabled |
+| USB Mode | Hardware CDC and JTAG |
+| Flash Size | 4MB |
+| **Partition Scheme** | **Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)** |
+
+Or with `arduino-cli` (arduino-esp32 core 3.3.x):
 
 ```
-arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=4M FumeLink
-arduino-cli upload  -p COM26 --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=4M FumeLink
+arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=4M,PartitionScheme=min_spiffs --output-dir build FumeLink
+arduino-cli upload  -p COM26 --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=4M,PartitionScheme=min_spiffs --input-dir build
 ```
 
-Settings at the top of `FumeLink.ino`: `RELAY_PIN`, `RELAY_ACTIVE_HIGH`, `runOnMs`,
-`LED_PIN`, `BUTTON_PIN`, `STATION_PREFIX`.
+**The first flash must be over USB with the Minimal SPIFFS partition scheme.** The firmware
+is about 1.2 MB, which nearly fills the default scheme's 1.3 MB firmware slots, and the
+partition layout can only be changed over USB. After that, update over WiFi.
+
+Settings at the top of `FumeLink.ino`: `RELAY_PIN`, `RELAY_ACTIVE_HIGH`, `runOnMs` (default
+only; the saved value wins), `LED_PIN`, `BUTTON_PIN`, `STATION_PREFIX`, `AP_SSID`,
+`AP_DEFAULT_PASS`.
 
 ## Testing the transistor stage
 
@@ -142,6 +197,10 @@ Do this on the bench before cutting into the extractor. Measure everything again
   or power-cycle the station to clear a stuck link.
 - **The fan never stops.** Check the shared ground, the transistor pinout, and that your
   extractor really stops at 0 V on its speed input.
+- **Forgot the hotspot password.** Connect USB and send `appass <new password>` over serial.
+- **The page doesn't load.** Make sure you're connected to the `FumeLink` network (phones
+  sometimes drop a WiFi without internet; tell yours to stay connected), then open
+  `http://192.168.4.1` with `http`, not `https`.
 
 ## How it works: the link protocol
 
